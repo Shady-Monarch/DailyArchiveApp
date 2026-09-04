@@ -54,11 +54,45 @@ def require_secrets():
         st.stop()
 
 
+def detect_redirect_uri_from_request():
+    """Build redirect URI from the current browser host (works on Cloud + local)."""
+    try:
+        headers = st.context.headers
+    except Exception:
+        return None
+
+    host = headers.get("X-Forwarded-Host") or headers.get("Host")
+    if not host:
+        return None
+
+    host = host.split(",")[0].strip()
+    proto = headers.get("X-Forwarded-Proto")
+    if proto:
+        proto = proto.split(",")[0].strip()
+    elif "streamlit.app" in host or "streamlitapp.com" in host:
+        proto = "https"
+    else:
+        proto = "http"
+
+    if host.endswith(":443") and proto == "https":
+        host = host[:-4]
+    elif host.endswith(":80") and proto == "http":
+        host = host[:-3]
+
+    return f"{proto}://{host}"
+
+
 def get_redirect_uri():
-    oauth = st.secrets["google_oauth"]
+    # Prefer the live request host so Cloud doesn't accidentally keep using localhost
+    # from secrets. Fall back to secrets, then local default.
+    detected = detect_redirect_uri_from_request()
+    if detected:
+        return detected.rstrip("/")
+
+    oauth = st.secrets.get("google_oauth", {})
     if oauth.get("redirect_uri"):
-        return str(oauth["redirect_uri"])
-    # Local Streamlit default. For Cloud, set google_oauth.redirect_uri explicitly.
+        return str(oauth["redirect_uri"]).rstrip("/")
+
     return "http://localhost:8501"
 
 
@@ -114,11 +148,12 @@ def save_pkce_store(store):
     OAUTH_PKCE_PATH.write_text(json.dumps(store, indent=2))
 
 
-def remember_pkce(state, code_verifier, auth_url):
+def remember_pkce(state, code_verifier, auth_url, redirect_uri):
     store = load_pkce_store()
     store[state] = {
         "code_verifier": code_verifier,
         "auth_url": auth_url,
+        "redirect_uri": redirect_uri,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     save_pkce_store(store)
@@ -217,26 +252,38 @@ def exchange_code_for_credentials(code, state):
 
 
 def begin_oauth_login():
-    # Reuse one pending login if we still have it; Streamlit reruns must not
-    # invalidate the button URL the user is about to click.
+    redirect_uri = get_redirect_uri()
+
+    # Reuse one pending login only if it was minted for this exact redirect URI.
     state = st.session_state.get("oauth_state")
     store = load_pkce_store()
-    if state and state in store and store[state].get("auth_url"):
-        auth_url = store[state]["auth_url"]
+    entry = store.get(state) if state else None
+    if (
+        state
+        and entry
+        and entry.get("auth_url")
+        and entry.get("redirect_uri") == redirect_uri
+    ):
+        auth_url = entry["auth_url"]
     else:
+        if state:
+            pop_pkce(state)
         flow = make_oauth_flow(autogenerate_code_verifier=True)
-        flow.redirect_uri = get_redirect_uri()
+        flow.redirect_uri = redirect_uri
         auth_url, state = flow.authorization_url(
             access_type="offline",
             prompt="consent",
         )
-        remember_pkce(state, flow.code_verifier, auth_url)
+        remember_pkce(state, flow.code_verifier, auth_url, redirect_uri)
         st.session_state["oauth_auth_url"] = auth_url
         st.session_state["oauth_state"] = state
         st.session_state["oauth_code_verifier"] = flow.code_verifier
 
     st.link_button("🔐 Sign in with Google", auth_url, type="primary", use_container_width=True)
-    st.caption(f"Redirect URI in use: `{get_redirect_uri()}` — this must match your OAuth client settings.")
+    st.warning(
+        f"Add this **exact** URI in Google Cloud → OAuth client → Authorized redirect URIs "
+        f"(and JS origins):\n\n`{redirect_uri}`"
+    )
     st.info("Click once, finish Google consent, and wait to be redirected back here.")
     if st.button("Reset sign-in link"):
         if st.session_state.get("oauth_state"):
